@@ -293,17 +293,48 @@ function drawSkeleton(keypoints, imgW, imgH) {
 // ============================================================
 function speakAlert() {
   if (muted) return;
-  // 取消之前的语音（如果有）
   speechSynth.cancel();
 
   const utter = new SpeechSynthesisUtterance(ALERT_TEXT);
   utter.lang = 'zh-CN';
-  utter.rate = 0.9;   // 稍慢一点，更清晰
+  utter.rate = 0.9;
   utter.pitch = 1.0;
   utter.volume = 1.0;
 
-  // 在 iOS 上需要用户交互才能播放语音，这里尝试
+  // 查找中文语音，找不到就用默认语音
+  const voices = speechSynth.getVoices();
+  const zhVoice = voices.find(v => v.lang.startsWith('zh'));
+  if (zhVoice) utter.voice = zhVoice;
+
+  // 如果浏览器不支持语音合成，用 Web Audio 做蜂鸣回退
+  utter.onerror = function(e) {
+    if (e.error === 'language-unavailable' || e.error === 'synthesis-failed') {
+      console.warn('语音不可用，使用蜂鸣回退');
+      beepFallback();
+    }
+  };
+
   speechSynth.speak(utter);
+}
+
+// 用 Web Audio API 生成 3 声短促提示音（语音不可用时的回退方案）
+function beepFallback() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    [0, 0.2, 0.4].forEach(function(delay) {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.frequency.value = 800;
+      osc.type = 'square';
+      gain.gain.setValueAtTime(0.3, ctx.currentTime + delay);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + delay + 0.15);
+      osc.start(ctx.currentTime + delay);
+      osc.stop(ctx.currentTime + delay + 0.15);
+    });
+  } catch(e) {
+    console.error('蜂鸣也失败:', e);
+  }
 }
 
 // iOS Safari 有时需要先"预热" SpeechSynthesis
@@ -412,7 +443,7 @@ async function start() {
 
     await initModel();
     await initCamera();
-    warmUpSpeech();
+    try { warmUpSpeech(); } catch(e) { console.warn('语音预热失败:', e); }
 
     loadingEl.style.display = 'none';
     isRunning = true;
