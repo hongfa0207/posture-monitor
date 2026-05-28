@@ -440,10 +440,17 @@ async function start() {
   try {
     loadingEl.style.display = 'block';
     startBtn.style.display = 'none';
+    statusText.textContent = '正在启动摄像头...';
 
-    await initModel();
+    // 先同步请求摄像头（iOS 要求 getUserMedia 在用户点击的同步调用链中）
     await initCamera();
     try { warmUpSpeech(); } catch(e) { console.warn('语音预热失败:', e); }
+
+    // 如果模型还没加载完，等待加载
+    if (!detector) {
+      statusText.textContent = '正在加载姿态检测模型...';
+      await initModel();
+    }
 
     loadingEl.style.display = 'none';
     isRunning = true;
@@ -463,25 +470,26 @@ function toggleMute() {
 }
 
 // ============================================================
-// 自动启动（页面加载完成后）
+// 页面加载：预加载模型，完成后显示启动按钮
 // ============================================================
-window.addEventListener('DOMContentLoaded', () => {
-  // 尝试自动启动，如果因用户交互限制失败则显示按钮
-  start().catch(() => {
-    // iOS Safari 可能阻止自动播放，显示手动启动按钮
-    startBtn.style.display = 'block';
-    loadingEl.style.display = 'none';
-  });
+window.addEventListener('DOMContentLoaded', async () => {
+  try {
+    await initModel();
+    statusText.textContent = '模型就绪，点击按钮开始';
+  } catch (e) {
+    statusText.textContent = '模型加载失败，请刷新重试';
+    console.error('模型预加载失败:', e);
+  }
+  loadingEl.style.display = 'none';
+  startBtn.style.display = 'block';
 });
 
 // 页面切换时停止
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
-    // 暂停检测节省资源
     isRunning = false;
     if (animFrameId) cancelAnimationFrame(animFrameId);
-  } else if (!isRunning && detector) {
-    // 恢复
+  } else if (!isRunning && detector && videoEl && videoEl.srcObject) {
     isRunning = true;
     badTime = 0;
     detectLoop();
