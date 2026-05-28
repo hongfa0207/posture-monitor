@@ -134,7 +134,8 @@ const LEFT_ANKLE = 15, RIGHT_ANKLE = 16;
 async function initModel() {
   const model = poseDetection.SupportedModels.MoveNet;
   detector = await poseDetection.createDetector(model, {
-    modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING
+    modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING,
+    modelUrl: 'model/model.json'
   });
   console.log('MoveNet Lightning 模型加载完成');
 }
