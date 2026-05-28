@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>坐姿监测 - 鲍一为</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { width:100%; height:100%; overflow:hidden; background:#000; font-family:'PingFang SC','Microsoft YaHei',sans-serif; }
+
+  /* 摄像头画面层 */
+  #video-container { position:relative; width:100%; height:100%; }
+  #video-el { position:absolute; top:0; left:0; width:100%; height:100%; object-fit:cover; transform:scaleX(-1); }
+  #canvas-el { position:absolute; top:0; left:0; width:100%; height:100%; }
+
+  /* 顶部状态条 */
+  #status-bar { position:absolute; top:0; left:0; right:0; padding:12px 16px; background:linear-gradient(rgba(0,0,0,0.7),transparent); z-index:10; display:flex; align-items:center; gap:10px; }
+  #status-dot { width:12px; height:12px; border-radius:50%; background:#0f0; flex-shrink:0; }
+  #status-dot.warn { background:#fa0; }
+  #status-dot.bad { background:#f00; animation:blink 0.5s infinite; }
+  @keyframes blink { 50% { opacity:0.3; } }
+  #status-text { color:#fff; font-size:16px; font-weight:600; text-shadow:0 1px 3px rgba(0,0,0,0.8); }
+
+  /* 底部提示 */
+  #bottom-hint { position:absolute; bottom:20px; left:0; right:0; text-align:center; color:rgba(255,255,255,0.5); font-size:13px; z-index:10; }
+
+  /* 倒计时环 */
+  #countdown-ring { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); z-index:15; pointer-events:none; }
+  #countdown-ring svg { width:100px; height:100px; transform:rotate(-90deg); }
+  #countdown-ring circle { fill:none; stroke-width:6; }
+  #ring-bg { stroke:rgba(255,255,255,0.15); }
+  #ring-fg { stroke:#fa0; stroke-dasharray:264; stroke-dashoffset:264; transition:stroke-dashoffset 0.3s; stroke-linecap:round; }
+
+  /* 加载提示 */
+  #loading { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); color:#fff; font-size:18px; text-align:center; z-index:20; }
+  #loading .spinner { width:40px; height:40px; border:3px solid rgba(255,255,255,0.3); border-top-color:#fff; border-radius:50%; animation:spin 1s linear infinite; margin:0 auto 15px; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+
+  /* 按钮 */
+  #start-btn { display:none; position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); z-index:20; background:#4CAF50; color:#fff; border:none; padding:18px 40px; font-size:20px; border-radius:50px; cursor:pointer; box-shadow:0 4px 15px rgba(0,0,0,0.4); }
+  #start-btn:active { background:#388E3C; }
+
+  /* 音量按钮 */
+  #volume-btn { position:absolute; top:14px; right:14px; z-index:11; background:rgba(0,0,0,0.5); border:none; color:#fff; font-size:20px; width:40px; height:40px; border-radius:50%; cursor:pointer; }
+</style>
+</head>
+<body>
+
+<div id="video-container">
+  <video id="video-el" autoplay playsinline></video>
+  <canvas id="canvas-el"></canvas>
+
+  <div id="status-bar">
+    <div id="status-dot"></div>
+    <span id="status-text">正在加载...</span>
+  </div>
+
+  <button id="volume-btn" onclick="toggleMute()">🔊</button>
+
+  <div id="countdown-ring" style="display:none">
+    <svg viewBox="0 0 100 100">
+      <circle id="ring-bg" cx="50" cy="50" r="42"/>
+      <circle id="ring-fg" cx="50" cy="50" r="42"/>
+    </svg>
+  </div>
+
+  <div id="loading">
+    <div class="spinner"></div>
+    <div>正在加载姿态检测模型...</div>
+  </div>
+
+  <button id="start-btn" onclick="start()">开启坐姿监测</button>
+  <div id="bottom-hint">摄像头画面仅在本地处理，不上传</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection@2.1.3/dist/pose-detection.min.js"></script>
+
+<script>
+// ============================================================
+// 配置参数（与 Python 版一致）
+// ============================================================
+const HEAD_FORWARD_ANGLE = 20;   // 头部前倾角度阈值
+const HEAD_DROP_RATIO = 0.25;    // 低头比例阈值
+const SHOULDER_WIDTH_RATIO = 0.9; // 驼背比例阈值
+const ALERT_DELAY_SEC = 3.0;     // 持续多少秒触发提醒
+const COOLDOWN_SEC = 10.0;       // 提醒冷却秒数
+const ALERT_TEXT = '鲍一为小朋友请坐正';
+
+// ============================================================
+// 全局状态
+// ============================================================
+let detector = null;
+let videoEl, canvasEl, ctx;
+let badTime = 0;           // 不良姿势累计秒数
+let lastAlertTime = 0;     // 上次提醒时间戳
+let isRunning = false;
+let muted = false;
+let fps = 0;
+let frameCount = 0;
+let fpsTimer = performance.now();
+let animFrameId = null;
+let speechSynth = window.speechSynthesis;
+let cameraFacing = 'user'; // 'user'=前置, 'environment'=后置
+
+// ============================================================
+// DOM 元素
+// ============================================================
+const statusDot = document.getElementById('status-dot');
+const statusText = document.getElementById('status-text');
+const countdownRing = document.getElementById('countdown-ring');
+const ringFg = document.getElementById('ring-fg');
+const loadingEl = document.getElementById('loading');
+const startBtn = document.getElementById('start-btn');
+const volumeBtn = document.getElementById('volume-btn');
+
+// ============================================================
+// MoveNet (17关键点) 索引
+// ============================================================
+const NOSE = 0, LEFT_EYE = 1, RIGHT_EYE = 2;
+const LEFT_EAR = 3, RIGHT_EAR = 4;
+const LEFT_SHOULDER = 5, RIGHT_SHOULDER = 6;
+const LEFT_ELBOW = 7, RIGHT_ELBOW = 8;
+const LEFT_WRIST = 9, RIGHT_WRIST = 10;
+const LEFT_HIP = 11, RIGHT_HIP = 12;
+const LEFT_KNEE = 13, RIGHT_KNEE = 14;
+const LEFT_ANKLE = 15, RIGHT_ANKLE = 16;
+
+// ============================================================
+// 初始化：加载模型
+// ============================================================
+async function initModel() {
+  const model = poseDetection.SupportedModels.MoveNet;
+  detector = await poseDetection.createDetector(model, {
+    modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING
+  });
+  console.log('MoveNet Lightning 模型加载完成');
+}
+
+// ============================================================
+// 初始化：打开摄像头
+// ============================================================
+async function initCamera() {
+  videoEl = document.getElementById('video-el');
+  canvasEl = document.getElementById('canvas-el');
+  ctx = canvasEl.getContext('2d');
+
+  const constraints = {
+    video: {
+      facingMode: cameraFacing,
+      width: { ideal: 640 },
+      height: { ideal: 480 }
+    },
+    audio: false
+  };
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    videoEl.srcObject = stream;
+    await videoEl.play();
+
+    // 等待视频尺寸就绪
+    await new Promise(r => { videoEl.onloadedmetadata = r; });
+
+    canvasEl.width = videoEl.videoWidth || 640;
+    canvasEl.height = videoEl.videoHeight || 480;
+    console.log('摄像头已就绪:', canvasEl.width, 'x', canvasEl.height);
+  } catch (e) {
+    console.error('摄像头错误:', e);
+    alert('无法访问摄像头。\n\n请确保：\n1. 已授予摄像头权限\n2. 使用 HTTPS 连接\n3. 使用 Safari 浏览器');
+    throw e;
+  }
+}
+
+// ============================================================
+// 姿态检测核心逻辑（与 Python 版完全一致）
+// ============================================================
+function checkPosture(keypoints, imgW, imgH) {
+  // 提取关键点坐标
+  function kp(idx) {
+    const p = keypoints[idx];
+    return (p && p.score > 0.4) ? { x: p.x, y: p.y } : null;
+  }
+
+  const nose = kp(NOSE);
+  const ls = kp(LEFT_SHOULDER);
+  const rs = kp(RIGHT_SHOULDER);
+  const lh = kp(LEFT_HIP);
+  const rh = kp(RIGHT_HIP);
+
+  if (!nose || !ls || !rs) return { bad: false, reason:'关键点缺失', metrics:{angle:0,drop:0,ratio:0} };
+
+  const reasons = [];
+  const metrics = { angle: 0, drop: 0, ratio: 0 };
+
+  // 双肩中点
+  const smX = (ls.x + rs.x) / 2;
+  const smY = (ls.y + rs.y) / 2;
+
+  // 肩宽（像素坐标下的距离）
+  const shoulderW = Math.sqrt((ls.x - rs.x)**2 + (ls.y - rs.y)**2);
+
+  // ---- 指标1: 头部前倾角度 ----
+  // 垂直向上参考点
+  const vUp = { x: smX, y: smY - 50 };
+  const snX = nose.x - smX;
+  const snY = nose.y - smY;
+  const vuX = vUp.x - smX;
+  const vuY = vUp.y - smY;
+
+  const dotSN = snX * vuX + snY * vuY;
+  const magSN = Math.sqrt(snX*snX + snY*snY);
+  const magVU = Math.sqrt(vuX*vuX + vuY*vuY);
+  let angle = 0;
+  if (magSN > 0 && magVU > 0) {
+    const cosA = Math.max(-1, Math.min(1, dotSN / (magSN * magVU)));
+    angle = Math.acos(cosA) * 180 / Math.PI;
+  }
+  metrics.angle = angle;
+  if (angle > HEAD_FORWARD_ANGLE) reasons.push(`头部前倾(${angle.toFixed(0)}°)`);
+
+  // ---- 指标2: 低头检测 ----
+  const dropRatio = (nose.y - smY) / Math.max(shoulderW, 1);
+  metrics.drop = dropRatio;
+  if (dropRatio > HEAD_DROP_RATIO) reasons.push(`低头(比${dropRatio.toFixed(2)})`);
+
+  // ---- 指标3: 含胸驼背 ----
+  if (lh && rh) {
+    const hmY = (lh.y + rh.y) / 2;
+    const torsoH = Math.abs(hmY - smY);
+    if (torsoH > 0) {
+      const wRatio = shoulderW / torsoH;
+      metrics.ratio = wRatio;
+      if (wRatio < SHOULDER_WIDTH_RATIO) reasons.push(`含胸驼背(比${wRatio.toFixed(1)})`);
+    }
+  }
+
+  if (reasons.length > 0) {
+    return { bad: true, reason: reasons.join('、'), metrics };
+  }
+  return { bad: false, reason: '坐姿良好', metrics };
+}
+
+// ============================================================
+// 绘制骨架
+// ============================================================
+function drawSkeleton(keypoints, imgW, imgH) {
+  // MoveNet 骨骼连接
+  const connections = [
+    [NOSE, LEFT_EYE], [LEFT_EYE, LEFT_EAR], [NOSE, RIGHT_EYE], [RIGHT_EYE, RIGHT_EAR],
+    [LEFT_SHOULDER, RIGHT_SHOULDER],
+    [LEFT_SHOULDER, LEFT_ELBOW], [LEFT_ELBOW, LEFT_WRIST],
+    [RIGHT_SHOULDER, RIGHT_ELBOW], [RIGHT_ELBOW, RIGHT_WRIST],
+    [LEFT_SHOULDER, LEFT_HIP], [RIGHT_SHOULDER, RIGHT_HIP],
+    [LEFT_HIP, RIGHT_HIP],
+    [LEFT_HIP, LEFT_KNEE], [LEFT_KNEE, LEFT_ANKLE],
+    [RIGHT_HIP, RIGHT_KNEE], [RIGHT_KNEE, RIGHT_ANKLE]
+  ];
+
+  const scaleX = canvasEl.width / imgW;
+  const scaleY = canvasEl.height / imgH;
+  const sc = Math.min(scaleX, scaleY);
+
+  // 绘制连接线
+  ctx.strokeStyle = 'rgba(0,255,100,0.7)';
+  ctx.lineWidth = 2;
+  for (const [a, b] of connections) {
+    const ka = keypoints[a], kb = keypoints[b];
+    if (ka && kb && ka.score > 0.4 && kb.score > 0.4) {
+      ctx.beginPath();
+      ctx.moveTo(ka.x * sc, ka.y * sc);
+      ctx.lineTo(kb.x * sc, kb.y * sc);
+      ctx.stroke();
+    }
+  }
+
+  // 绘制关键点
+  for (const kp of keypoints) {
+    if (kp && kp.score > 0.4) {
+      ctx.fillStyle = 'rgba(0,255,100,0.9)';
+      ctx.beginPath();
+      ctx.arc(kp.x * sc, kp.y * sc, 5, 0, 2*Math.PI);
+      ctx.fill();
+    }
+  }
+}
+
+// ============================================================
+// 语音提醒
+// ============================================================
+function speakAlert() {
+  if (muted) return;
+  // 取消之前的语音（如果有）
+  speechSynth.cancel();
+
+  const utter = new SpeechSynthesisUtterance(ALERT_TEXT);
+  utter.lang = 'zh-CN';
+  utter.rate = 0.9;   // 稍慢一点，更清晰
+  utter.pitch = 1.0;
+  utter.volume = 1.0;
+
+  // 在 iOS 上需要用户交互才能播放语音，这里尝试
+  speechSynth.speak(utter);
+}
+
+// iOS Safari 有时需要先"预热" SpeechSynthesis
+function warmUpSpeech() {
+  const u = new SpeechSynthesisUtterance('');
+  u.volume = 0;
+  speechSynth.speak(u);
+}
+
+// ============================================================
+// 主循环
+// ============================================================
+async function detectLoop() {
+  if (!isRunning) return;
+
+  try {
+    const imgW = videoEl.videoWidth;
+    const imgH = videoEl.videoHeight;
+
+    // 执行姿态检测
+    const poses = await detector.estimatePoses(videoEl, {
+      flipHorizontal: false  // 我们已用CSS翻转画面
+    });
+
+    // 清空画布，绘制骨架
+    ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+
+    const now = performance.now() / 1000;  // 秒
+
+    if (poses.length > 0 && poses[0].keypoints) {
+      const kps = poses[0].keypoints;
+      drawSkeleton(kps, imgW, imgH);
+
+      // 坐姿判断
+      const result = checkPosture(kps, imgW, imgH);
+      const inCooldown = (now - lastAlertTime) < COOLDOWN_SEC;
+
+      if (result.bad) {
+        badTime += 1 / Math.max(fps, 1);  // 累加秒数
+        const progress = Math.min(badTime / ALERT_DELAY_SEC, 1.0);
+
+        // 倒计时环
+        countdownRing.style.display = 'block';
+        ringFg.style.strokeDashoffset = 264 * (1 - progress);
+
+        if (badTime >= ALERT_DELAY_SEC && !inCooldown) {
+          // 触发提醒！
+          console.log('[提醒]', result.reason);
+          speakAlert();
+          lastAlertTime = now;
+          badTime = 0;
+          countdownRing.style.display = 'none';
+          statusDot.className = 'bad';
+          statusText.textContent = '⚠ 请调整坐姿！';
+          ringFg.style.stroke = '#f00';
+        } else if (badTime >= ALERT_DELAY_SEC && inCooldown) {
+          ringFg.style.stroke = '#fa0';
+          statusDot.className = 'warn';
+          const remain = Math.ceil(COOLDOWN_SEC - (now - lastAlertTime));
+          statusText.textContent = `冷却中 ${remain}s | ${result.reason}`;
+        } else {
+          ringFg.style.stroke = '#fa0';
+          statusDot.className = 'warn';
+          statusText.textContent = `${result.reason} (${badTime.toFixed(1)}s)`;
+        }
+      } else {
+        // 坐姿良好
+        badTime = 0;
+        countdownRing.style.display = 'none';
+        statusDot.className = '';
+        statusText.textContent = '✓ 坐姿良好';
+        ringFg.style.stroke = '#fa0';
+        ringFg.style.strokeDashoffset = 264;
+      }
+    } else {
+      // 未检测到人
+      badTime = 0;
+      countdownRing.style.display = 'none';
+      statusDot.className = '';
+      statusText.textContent = '未检测到人体';
+      ringFg.style.strokeDashoffset = 264;
+    }
+
+    // 帧率
+    frameCount++;
+    if (now * 1000 - fpsTimer > 1000) {
+      fps = frameCount;
+      frameCount = 0;
+      fpsTimer = now * 1000;
+    }
+
+  } catch (e) {
+    console.error('检测循环错误:', e);
+  }
+
+  animFrameId = requestAnimationFrame(detectLoop);
+}
+
+// ============================================================
+// 启动/停止
+// ============================================================
+async function start() {
+  try {
+    loadingEl.style.display = 'block';
+    startBtn.style.display = 'none';
+
+    await initModel();
+    await initCamera();
+    warmUpSpeech();
+
+    loadingEl.style.display = 'none';
+    isRunning = true;
+    statusText.textContent = '坐姿监测中...';
+    detectLoop();
+  } catch (e) {
+    loadingEl.style.display = 'none';
+    startBtn.style.display = 'block';
+    startBtn.textContent = '重试';
+    console.error('启动失败:', e);
+  }
+}
+
+function toggleMute() {
+  muted = !muted;
+  volumeBtn.textContent = muted ? '🔇' : '🔊';
+}
+
+// ============================================================
+// 自动启动（页面加载完成后）
+// ============================================================
+window.addEventListener('DOMContentLoaded', () => {
+  // 尝试自动启动，如果因用户交互限制失败则显示按钮
+  start().catch(() => {
+    // iOS Safari 可能阻止自动播放，显示手动启动按钮
+    startBtn.style.display = 'block';
+    loadingEl.style.display = 'none';
+  });
+});
+
+// 页面切换时停止
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    // 暂停检测节省资源
+    isRunning = false;
+    if (animFrameId) cancelAnimationFrame(animFrameId);
+  } else if (!isRunning && detector) {
+    // 恢复
+    isRunning = true;
+    badTime = 0;
+    detectLoop();
+  }
+});
+</script>
+
+</body>
+</html>
